@@ -1,228 +1,164 @@
 import os
-import time
-from typing import List, Dict, Any
-
+import requests
 import streamlit as st
-import pandas as pd
 import yfinance as yf
 
-# =========================
-# SECRETS / CONFIG
-# =========================
-def get_secret(section: str, key: str, default: str = "") -> str:
-    """Safe getter for streamlit secrets."""
-    if section in st.secrets and key in st.secrets[section]:
-        return st.secrets[section][key]
-    return os.getenv(key, default)
+# ========== CONFIG ==========
+st.set_page_config(page_title="Monreon Stock AI", page_icon="📈", layout="wide")
 
-PAYHIP_SECRET = get_secret("payhip", "SECRET_KEY", "")
-OPENAI_API_KEY = get_secret("payhip", "OPENAI_API_KEY", "")  # optional – only if you want GPT analysis
+# ======== SECRETS / ENV ========
+def get_secret(name: str, default: str = "") -> str:
+    # try streamlit secrets first
+    if name in st.secrets:
+        return st.secrets[name]
+    # fallback to env
+    return os.getenv(name, default)
 
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY", "")
+GUMROAD_PRODUCT_PERMALINK = get_secret("GUMROAD_PRODUCT_PERMALINK", "gtkwix")  # your product
 
-# =========================
-# PAYHIP LICENSE CHECK
-# =========================
-def verify_payhip_license(secret_key: str, license_key: str, customer_email: str) -> bool:
+# ======== GUMROAD VERIFY ========
+def verify_gumroad_license(license_key: str) -> bool:
     """
-    Very simple placeholder verifier.
-    Real Payhip verification = call their API with secret key + license.
-    Here we just check that user typed something and that we have our secret.
+    Calls Gumroad's license API to check if the key is valid.
+    Docs: https://gumroad.com/api#verify-license
     """
-    if not secret_key:
-        return False
-    if not license_key:
-        return False
-    # You can add real API call here later.
-    return True
-
-
-# =========================
-# STOCK UNIVERSE
-# =========================
-# You said “all possible stocks” — but that’s huge.
-# For now we scan a starter universe. You can grow this list later
-# or load it from a Google Sheet.
-DEFAULT_UNIVERSE = [
-    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN",
-    "META", "TSLA", "AMD", "AVGO", "NFLX",
-    "JPM", "V", "MA", "ADBE", "COST",
-    "UNH", "PEP", "KO", "ORCL", "INTC"
-]
-
-
-# =========================
-# DATA HELPERS
-# =========================
-@st.cache_data(ttl=300)
-def get_stock_snapshot(ticker: str) -> Dict[str, Any]:
-    """
-    Pulls quick data for a ticker.
-    Returns price, 52w high/low, and simple momentum.
-    """
+    url = "https://api.gumroad.com/v2/licenses/verify"
+    payload = {
+        "product_permalink": GUMROAD_PRODUCT_PERMALINK,
+        "license_key": license_key,
+        "increment_uses_count": True,
+    }
     try:
-        t = yf.Ticker(ticker)
-        hist = t.history(period="6mo")
-        info = t.fast_info  # faster than .info
-        if hist.empty:
-            return {}
+        resp = requests.post(url, data=payload, timeout=10)
+        data = resp.json()
+        # Gumroad returns { success: true/false, ... }
+        return bool(data.get("success"))
+    except Exception as e:
+        st.error(f"Couldn't reach Gumroad: {e}")
+        return False
 
-        last_price = float(hist["Close"].iloc[-1])
-        first_price = float(hist["Close"].iloc[0])
-        pct_change_6m = (last_price - first_price) / first_price * 100
-
-        # 52 week data
-        high_52w = getattr(info, "year_high", None)
-        low_52w = getattr(info, "year_low", None)
-
-        return {
-            "ticker": ticker,
-            "price": last_price,
-            "pct_change_6m": pct_change_6m,
-            "52w_high": high_52w,
-            "52w_low": low_52w,
-        }
-    except Exception:
-        return {}
-
-
-def score_stock(row: Dict[str, Any]) -> float:
+# ======== OPENAI CALL ========
+def ai_comment_on_stock(ticker: str, info: dict) -> str:
     """
-    Very simple scoring: higher 6M momentum gets higher score.
-    You can improve this later (volume, RSI, EPS surprises, news sentiment…)
+    Simple AI layer to explain the stock in plain English.
+    Uses your OpenAI key from secrets.
     """
-    if not row:
-        return 0.0
-    score = 0.0
-    # momentum
-    score += max(min(row.get("pct_change_6m", 0) / 5, 10), -10)
-    # proximity to 52w high
-    price = row.get("price")
-    high_52w = row.get("52w_high")
-    if price and high_52w:
-        dist = (high_52w - price) / high_52w * 100
-        if dist < 10:  # near breakout
-            score += 2
-    return round(score, 2)
+    if not OPENAI_API_KEY:
+        return "⚠️ No OpenAI API key found in secrets. Add OPENAI_API_KEY."
 
+    # build a short context with price etc
+    current_price = info.get("current_price")
+    long_name = info.get("long_name") or ticker.upper()
 
-def scan_universe(tickers: List[str]) -> pd.DataFrame:
-    results = []
-    for tk in tickers:
-        snap = get_stock_snapshot(tk)
-        if snap:
-            snap["score"] = score_stock(snap)
-            results.append(snap)
-        time.sleep(0.1)  # be nice to yfinance
-    if not results:
-        return pd.DataFrame()
-    df = pd.DataFrame(results)
-    df = df.sort_values("score", ascending=False)
-    return df
+    prompt = f"""
+You are an AI stock helper. The user is considering stock {long_name} ({ticker.upper()}).
+Current price: {current_price}
 
+Give a short 3–5 bullet insight: possible trend, risk, and what to watch.
+Do NOT give financial advice, just analysis.
+"""
 
-# =========================
-# UI
-# =========================
-st.set_page_config(
-    page_title="Monreon Stock AI",
-    page_icon="📈",
-    layout="wide",
-)
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
 
-st.title("📈 Monreon Stock AI — Market Scanner")
-st.write("Scan a list of stocks, score them, and show buyers only if they have a valid Payhip license.")
-
-# ---- LICENSE GATE ----
-with st.sidebar:
-    st.header("🔐 License check")
-    email_input = st.text_input("Customer email (same as Payhip)", "")
-    license_input = st.text_input("License key", type="password")
-    st.caption("You get this automatically after buying on Payhip.")
-
-    if st.button("Unlock tool"):
-        if verify_payhip_license(PAYHIP_SECRET, license_input, email_input):
-            st.session_state["license_ok"] = True
-            st.success("License verified ✅")
-        else:
-            st.session_state["license_ok"] = False
-            st.error("License invalid ❌")
-
-# Check license state
-if not st.session_state.get("license_ok", False):
-    st.warning("This tool is locked. Enter your Payhip email + license key in the sidebar to unlock.")
-    st.stop()
-
-# ---- MAIN TOOL ----
-st.success("Access granted ✅")
-
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("1. Choose stock universe")
-    mode = st.radio(
-        "Scan mode",
-        ["Use default list (Top US tech & large caps)", "I will paste my own tickers"],
-    )
-
-with col2:
-    st.subheader("2. Scan options")
-    top_n = st.slider("How many top ideas to show?", 5, 50, 15)
-
-# get tickers
-if mode == "Use default list (Top US tech & large caps)":
-    tickers_to_scan = DEFAULT_UNIVERSE
-    st.info(f"📦 Using built-in list of {len(DEFAULT_UNIVERSE)} tickers.")
-else:
-    user_tickers = st.text_area(
-        "Paste tickers separated by commas (e.g. AAPL, TSLA, NVDA, MSFT)",
-        "",
-    )
-    tickers_to_scan = [t.strip().upper() for t in user_tickers.split(",") if t.strip()]
-    st.info(f"📦 You provided {len(tickers_to_scan)} tickers.")
-
-if st.button("🚀 Run market scan"):
-    if not tickers_to_scan:
-        st.error("Please provide at least 1 ticker.")
-    else:
-        with st.spinner("Scanning market and ranking opportunities…"):
-            df = scan_universe(tickers_to_scan)
-        if df.empty:
-            st.error("Could not fetch any data. Try fewer tickers or later.")
-        else:
-            st.success(f"Found {len(df)} stocks. Showing best {top_n}.")
-            st.dataframe(df.head(top_n), use_container_width=True)
-
-            # quick download
-            csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download full results as CSV",
-                csv,
-                "monreon-stock-scan.csv",
-                "text/csv",
-            )
-
-            st.markdown("##### How scores work")
-            st.markdown(
-                "- Based on 6-month momentum\n"
-                "- Small bonus if price is near 52-week high\n"
-                "- You can later plug GPT here to generate written insights per ticker"
-            )
-
-# =========================
-# OPTIONAL: AI EXPLANATION (if you set OPENAI_API_KEY in secrets)
-# =========================
-if OPENAI_API_KEY:
-    from openai import OpenAI
-    client = OpenAI(api_key=OPENAI_API_KEY)
-
-    st.subheader("🧠 AI insight (optional)")
-    picked = st.text_input("Type a ticker from the table to get AI insight", "AAPL")
-    if st.button("Generate AI insight"):
-        prompt = f"Give me a SHORT, non-investment-advice overview of the stock {picked}. Mention recent momentum, and what a trader might look for."
-        resp = client.chat.completions.create(
+        res = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": "You analyze stocks in a neutral, educational way."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.4,
             max_tokens=250,
         )
-        st.write(resp.choices[0].message.content)
-else:
-    st.info("Add your OPENAI_API_KEY to Streamlit secrets if you want AI text insights.")
+        return res.choices[0].message.content.strip()
+    except Exception as e:
+        return f"⚠️ AI request failed: {e}"
+
+# ======== STOCK FETCH ========
+def fetch_stock_data(ticker: str):
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="5d")
+        info = stock.info
+        price = None
+        if "regularMarketPrice" in info:
+            price = info["regularMarketPrice"]
+        elif not hist.empty:
+            price = float(hist["Close"][-1])
+
+        return {
+            "ticker": ticker.upper(),
+            "long_name": info.get("longName"),
+            "current_price": price,
+            "history": hist,
+        }
+    except Exception as e:
+        st.error(f"Couldn't fetch {ticker}: {e}")
+        return None
+
+# ======== UI START ========
+st.title("📈 Monreon Stock Market AI")
+st.write("AI-powered stock insights. License-locked via Gumroad.")
+
+# keep license in session so user doesn’t re-enter
+if "license_ok" not in st.session_state:
+    st.session_state.license_ok = False
+
+if not st.session_state.license_ok:
+    st.subheader("🔑 Enter your license key")
+    lic = st.text_input("Paste the license key you got from Gumroad", type="password")
+
+    if st.button("Verify license"):
+        if lic.strip():
+            valid = verify_gumroad_license(lic.strip())
+            if valid:
+                st.session_state.license_ok = True
+                st.success("✅ License verified. Welcome!")
+                st.rerun()
+            else:
+                st.error("❌ License not valid for this product. Check your Gumroad receipt.")
+        else:
+            st.warning("Please paste a license key.")
+    st.stop()  # do not show the rest
+
+# ======== MAIN APP (unlocked) ========
+st.success("✅ License active")
+
+st.write("Enter 1 or more tickers (comma-separated): e.g. `AAPL, TSLA, NVDA`")
+tickers_input = st.text_input("Tickers", "AAPL")
+
+if st.button("Analyze"):
+    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+    if not tickers:
+        st.warning("Add at least one ticker.")
+    else:
+        for t in tickers:
+            st.markdown(f"### {t}")
+            data = fetch_stock_data(t)
+            if not data:
+                st.warning(f"Skipped {t}")
+                continue
+
+            # show price
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                st.metric("Current price", data.get("current_price", "N/A"))
+                if data.get("long_name"):
+                    st.caption(data["long_name"])
+            with col2:
+                if data.get("history") is not None and not data["history"].empty:
+                    st.line_chart(data["history"]["Close"])
+                else:
+                    st.write("No recent price history.")
+
+            # AI insight
+            with st.spinner("Calling AI..."):
+                ai_text = ai_comment_on_stock(t, data)
+            st.markdown("**AI insight:**")
+            st.write(ai_text)
+            st.divider()
+
+# footer
+st.caption("Monreon AI • secured with Gumroad licensing")
