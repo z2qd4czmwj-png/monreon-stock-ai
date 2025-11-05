@@ -1,211 +1,288 @@
-# app.py — Monreon AI (Gumroad-protected)
-from __future__ import annotations
 import os
-import time
-from typing import Dict, Any, List
-
-import streamlit as st
+import datetime
 import requests
+import streamlit as st
+import yfinance as yf
+import pandas as pd
 
-# =============== PAGE CONFIG ===============
-st.set_page_config(
-    page_title="Monreon Stock AI",
-    page_icon="📈",
-    layout="wide",
-)
-
-# =============== STYLING ===============
-st.markdown(
-    """
-    <style>
-    body, [data-testid="stAppViewContainer"] {
-        background: #000000 !important;
-    }
-    .main .block-container {
-        background: #ffffff;
-        border-radius: 14px;
-        padding: 1.5rem 1.5rem 3rem 1.5rem;
-        box-shadow: 0 6px 26px rgba(0,0,0,0.2);
-        margin-top: 1.4rem;
-    }
-    [data-testid="stSidebar"] {
-        background: #0A1733 !important;
-    }
-    [data-testid="stSidebar"] * {
-        color: #ffffff !important;
-    }
-    .stButton>button {
-        background: #0A1733 !important;
-        color: #ffffff !important;
-        border-radius: 999px !important;
-        border: 0 !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# =============== SECRETS HELPERS ===============
-def get_secret(path: str, key: str, default: str = "") -> str:
-    """
-    Reads from st.secrets[path][key] if available, falls back to env, then default.
-    Example: get_secret("gumroad", "PRODUCT_PERMALINK")
-    """
+# =========================
+# SECRETS / CONFIG
+# =========================
+def get_secret(section: str, key: str, default: str = "") -> str:
     try:
-        if path in st.secrets and key in st.secrets[path]:
-            return st.secrets[path][key]
+        if section in st.secrets and key in st.secrets[section]:
+            return st.secrets[section][key]
     except Exception:
         pass
     return os.getenv(key, default)
 
-
-# =============== CONFIG FROM SECRETS ===============
 GUMROAD_PRODUCT_PERMALINK = get_secret("gumroad", "PRODUCT_PERMALINK", "")
-GUMROAD_ACCESS_TOKEN = get_secret("gumroad", "ACCESS_TOKEN", "")
+GUMROAD_ACCESS_TOKEN      = get_secret("gumroad", "ACCESS_TOKEN", "")
+OPENAI_API_KEY            = get_secret("openai", "OPENAI_API_KEY", "")
+MAX_USES_PER_DAY          = int(get_secret("app", "MAX_USES_PER_DAY", "50"))
 
-# MAX_USES_PER_DAY can be flat at root (like older version)
-MAX_USES_RAW = st.secrets.get("MAX_USES_PER_DAY", "50")
-try:
-    MAX_USES_PER_DAY = int(MAX_USES_RAW)
-except Exception:
-    MAX_USES_PER_DAY = 50  # fallback
-
-# =============== LICENSE VERIFY ===============
-def verify_gumroad_license(license_key: str) -> Dict[str, Any]:
-    """
-    Calls Gumroad's /v2/licenses/verify endpoint.
-    Returns the full JSON so we can inspect refunded, chargeback, etc.
-    """
+# =========================
+# GUMROAD LICENSE CHECK
+# =========================
+def verify_gumroad_license(license_key: str):
     if not GUMROAD_PRODUCT_PERMALINK:
-        # during dev you can allow access
-        return {"success": True, "dev_mode": True}
+        return False, {"message": "Missing Gumroad product permalink."}
 
     url = "https://api.gumroad.com/v2/licenses/verify"
     payload = {
         "product_permalink": GUMROAD_PRODUCT_PERMALINK,
         "license_key": license_key,
-        "increment_uses_count": True,
     }
-    # if we have access token, add it
     if GUMROAD_ACCESS_TOKEN:
         payload["access_token"] = GUMROAD_ACCESS_TOKEN
 
     try:
-        r = requests.post(url, data=payload, timeout=10)
-        j = r.json()
-        return j
+        resp = requests.post(url, data=payload, timeout=10)
+        data = resp.json()
+        return data.get("success", False), data
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return False, {"message": f"API error: {e}"}
 
 
-def license_gate():
+# =========================
+# SESSION / DAILY USAGE
+# =========================
+def init_state():
+    if "license_valid" not in st.session_state:
+        st.session_state.license_valid = False
+        st.session_state.license_data = {}
+    if "uses_today" not in st.session_state:
+        st.session_state.uses_today = 0
+    if "uses_date" not in st.session_state:
+        st.session_state.uses_date = datetime.date.today().isoformat()
+
+
+def reset_if_new_day():
+    today = datetime.date.today().isoformat()
+    if st.session_state.get("uses_date") != today:
+        st.session_state.uses_today = 0
+        st.session_state.uses_date = today
+
+
+def bump_usage():
+    st.session_state.uses_today += 1
+
+
+# =========================
+# DATA + ANALYSIS HELPERS
+# =========================
+def fetch_price_history(ticker: str, period="6mo", interval="1d"):
+    try:
+        df = yf.download(ticker, period=period, interval=interval, progress=False)
+        if not df.empty:
+            return df
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def calc_momentum(df):
+    if df.empty:
+        return {"error": "No data"}
+    close = df["Close"]
+    latest = close.iloc[-1]
+    week = (latest - close.iloc[-5]) / close.iloc[-5] * 100 if len(close) > 5 else None
+    month = (latest - close.iloc[-21]) / close.iloc[-21] * 100 if len(close) > 21 else None
+    return {"last_price": latest, "1w_change_pct": week, "1m_change_pct": month}
+
+
+def calc_moving_avgs(df):
+    if df.empty:
+        return {"error": "No data"}
+    close = df["Close"]
+    out = {"last_price": close.iloc[-1]}
+    for win in [5, 20, 50, 100, 200]:
+        if len(close) >= win:
+            out[f"SMA_{win}"] = close.rolling(win).mean().iloc[-1]
+    return out
+
+
+def calc_volatility(df):
+    if df.empty:
+        return {"error": "No data"}
+    returns = df["Close"].pct_change().dropna()
+    daily = returns.std()
+    ann = daily * (252 ** 0.5)
+    return {"daily_volatility": float(daily), "annualized_volatility": float(ann)}
+
+
+def fetch_fundamentals(ticker: str):
+    try:
+        info = yf.Ticker(ticker).fast_info
+        return {
+            "last_price": info.get("lastPrice"),
+            "market_cap": info.get("marketCap"),
+            "year_high": info.get("yearHigh"),
+            "year_low": info.get("yearLow"),
+            "currency": info.get("currency"),
+        }
+    except Exception:
+        return {"error": "Fundamentals unavailable"}
+
+
+def ai_commentary(ticker, metrics, mode):
+    if not OPENAI_API_KEY:
+        return "AI commentary unavailable (no OpenAI key configured)."
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        prompt = (
+            f"You are a professional market analyst. "
+            f"Summarize {ticker}'s outlook based on: {metrics}. "
+            f"Use a confident tone and highlight sentiment (bullish/bearish/neutral). "
+            f"Give 3 concise actionable points."
+        )
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200,
+            temperature=0.4,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"AI failed: {e}"
+
+
+# =========================
+# MARKET TOP 10
+# =========================
+def top_10_traded():
     """
-    Sidebar auth gate. Blocks the rest of the app until valid Gumroad license is provided.
-    Also enforces per-day usage in session.
+    Returns a static list (YFinance doesn’t provide live volume screeners)
     """
-    # init session
-    st.session_state.setdefault("is_authed", False)
-    st.session_state.setdefault("uses_today", 0)
-    st.session_state.setdefault("day_stamp", time.strftime("%Y-%m-%d"))
+    return ["AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "META", "GOOG", "NFLX", "AMD", "INTC"]
 
-    # reset daily counter if new day
-    today = time.strftime("%Y-%m-%d")
-    if st.session_state["day_stamp"] != today:
-        st.session_state["day_stamp"] = today
-        st.session_state["uses_today"] = 0
 
-    with st.sidebar:
-        st.header("🔐 Monreon AI Login")
-        st.caption("Enter your Gumroad license key to unlock.")
-        lic = st.text_input("License key from Gumroad", type="password")
-        btn = st.button("Unlock")
+# =========================
+# STREAMLIT UI
+# =========================
+st.set_page_config(page_title="Monreon Stock AI — Advanced Market Scanner", layout="wide")
+init_state()
+reset_if_new_day()
 
-        # show daily usage
-        if MAX_USES_PER_DAY > 0:
-            st.write(f"Today: {st.session_state['uses_today']} / {MAX_USES_PER_DAY}")
+# ---- SIDEBAR ----
+with st.sidebar:
+    st.markdown("### 🔐 Monreon AI Login")
+    license_key = st.text_input("License key", type="password")
+    if st.button("Unlock"):
+        ok, data = verify_gumroad_license(license_key)
+        if ok:
+            st.session_state.license_valid = True
+            st.session_state.license_data = data
+            st.success("✅ License verified!")
+        else:
+            st.error(data.get("message", "License invalid."))
 
-    if st.session_state["is_authed"]:
-        return  # already in
+    st.write(f"Today: {st.session_state.uses_today} / {MAX_USES_PER_DAY}")
 
-    if btn:
-        if not lic.strip():
-            st.error("Please enter your license key.")
-            st.stop()
-
-        result = verify_gumroad_license(lic.strip())
-        if not result.get("success"):
-            st.error("❌ License not valid for this product. Check you bought the right one.")
-            st.stop()
-
-        # extra safety: block refunded / chargeback
-        purchase = result.get("purchase", {})
-        if purchase.get("refunded") or purchase.get("chargebacked"):
-            st.error("❌ This license was refunded or chargebacked.")
-            st.stop()
-
-        # save auth
-        st.session_state["is_authed"] = True
-        st.session_state["license_key"] = lic.strip()
-        st.success("✅ License verified. Welcome!")
-        st.rerun()
-
-    # if no button pressed yet -> block app
-    if not st.session_state["is_authed"]:
-        st.title("Monreon Stock AI")
-        st.info("This tool is protected. Enter your Gumroad license key in the sidebar to continue.")
+    if not st.session_state.license_valid:
+        st.stop()
+    if st.session_state.uses_today >= MAX_USES_PER_DAY:
+        st.error("Daily usage limit reached.")
         st.stop()
 
+# ---- HEADER ----
+st.title("📊 Monreon Stock AI — Advanced Market Scanner")
+st.caption("Smarter analysis powered by AI + market data")
 
-def check_daily_quota():
-    """
-    Enforces daily limit stored in session.
-    """
-    if MAX_USES_PER_DAY <= 0:
-        return  # unlimited
+# Small market overview
+st.markdown("#### 🏦 Market Snapshot")
+major_indices = {"S&P 500": "^GSPC", "NASDAQ": "^IXIC", "Dow Jones": "^DJI"}
+cols = st.columns(3)
+for i, (name, symbol) in enumerate(major_indices.items()):
+    df = fetch_price_history(symbol, period="5d")
+    if not df.empty:
+        latest = df["Close"].iloc[-1]
+        change = (df["Close"].iloc[-1] - df["Close"].iloc[-2]) / df["Close"].iloc[-2] * 100
+        cols[i].metric(name, f"${latest:,.2f}", f"{change:+.2f}%")
 
-    used = st.session_state.get("uses_today", 0)
-    if used >= MAX_USES_PER_DAY:
-        st.error("You have reached today's usage limit. Please come back tomorrow.")
-        st.stop()
+st.divider()
 
+# ---- USER INPUT ----
+preset = st.radio("Choose input mode:", ["Manual input", "Top 10 Most Traded US Stocks"])
+if preset == "Manual input":
+    tickers_raw = st.text_input("Enter tickers (comma separated)", "AAPL, TSLA, NVDA")
+else:
+    tickers_raw = ", ".join(top_10_traded())
+    st.info("Auto-filled with Top 10 Most Traded Stocks")
 
-def count_use():
-    st.session_state["uses_today"] = st.session_state.get("uses_today", 0) + 1
+periods = {
+    "6 months (1d)": ("6mo", "1d"),
+    "1 month (1d)": ("1mo", "1d"),
+    "5 days (15m)": ("5d", "15m"),
+    "1 day (5m)": ("1d", "5m"),
+}
+col1, col2 = st.columns([2, 2])
+with col1:
+    period_label = st.selectbox("Timeframe", list(periods.keys()))
+with col2:
+    mode = st.selectbox(
+        "Analysis mode",
+        [
+            "Find momentum",
+            "Check moving averages",
+            "Check volatility",
+            "Quick fundamentals",
+            "AI summary (if OpenAI key)",
+        ],
+    )
 
-
-# =============== RUN AUTH GATE FIRST ===============
-license_gate()
-
-# =============== MAIN APP (after auth) ===============
-st.title("📈 Monreon Stock AI — Market Scanner")
-st.caption("AI-powered stock research. Licensed version.")
-
-# check daily usage
-check_daily_quota()
-
-# simple input UI
-tickers_raw = st.text_input("Enter tickers (comma separated)", "AAPL, TSLA, NVDA")
-purpose = st.selectbox("What do you want?", ["Quick health check", "Find momentum", "AI summary"])
-
-# when user clicks generate/analyze
-if st.button("Analyze now"):
-    count_use()  # increase usage
+period, interval = periods[period_label]
+if st.button("🔍 Analyze Now", type="primary"):
+    bump_usage()
     tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
-    if not tickers:
-        st.warning("Please enter at least one ticker.")
-    else:
-        st.subheader("Scan Result")
-        for t in tickers:
-            st.markdown(f"**{t}**")
-            st.write("- Recent price: (fetch with yfinance or your data source)")
-            st.write("- AI opinion: This is where you'd add OpenAI analysis.")
-            st.write("---")
+    all_rows = []
 
-st.markdown(
-    """
-    <p style="font-size:11px; margin-top:2rem; color:#666;">
-    © 2025 Monreon AI. Licensed for personal/client use only. Redistribution or sharing of license keys is prohibited.
-    </p>
-    """,
-    unsafe_allow_html=True,
-)
+    for ticker in tickers:
+        st.subheader(f"📈 {ticker}")
+        df = fetch_price_history(ticker, period=period, interval=interval)
+
+        if df.empty:
+            st.warning("No data available.")
+            continue
+
+        # Chart with price + volume
+        chart_cols = st.columns([3, 1])
+        with chart_cols[0]:
+            st.line_chart(df[["Close"]], height=220)
+        with chart_cols[1]:
+            st.bar_chart(df[["Volume"]], height=220)
+
+        if mode == "Find momentum":
+            metrics = calc_momentum(df)
+        elif mode == "Check moving averages":
+            metrics = calc_moving_avgs(df)
+        elif mode == "Check volatility":
+            metrics = calc_volatility(df)
+        elif mode == "Quick fundamentals":
+            metrics = fetch_fundamentals(ticker)
+        else:
+            metrics = {"last_close": float(df["Close"].iloc[-1])}
+
+        if "error" in metrics:
+            st.error(metrics["error"])
+            continue
+
+        st.write(metrics)
+        summary = ai_commentary(ticker, metrics, mode)
+        st.info(summary)
+
+        row = {"ticker": ticker, "mode": mode, **metrics, "ai_commentary": summary}
+        all_rows.append(row)
+        st.divider()
+
+    if all_rows:
+        out_df = pd.DataFrame(all_rows)
+        st.download_button(
+            "⬇️ Download results as CSV",
+            data=out_df.to_csv(index=False).encode(),
+            file_name="monreon_stock_ai_results.csv",
+            mime="text/csv",
+        )
+
+st.caption("© 2025 Monreon AI. Licensed for personal/client use only. Redistribution or sharing of license keys is prohibited.")
