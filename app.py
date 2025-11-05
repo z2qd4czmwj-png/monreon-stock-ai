@@ -1,4 +1,4 @@
-# app.py — Monreon Stock AI (Gumroad protected)
+# app.py — Monreon Stock AI (Gumroad protected, fixed market header)
 import streamlit as st
 import requests
 import pandas as pd
@@ -9,12 +9,15 @@ from typing import Dict, Any, List
 # ===============================
 # 1. READ SECRETS / CONFIG
 # ===============================
-# These should be in your secrets.toml:
+# secrets.toml should look like:
+#
 # [gumroad]
-# ACCESS_TOKEN = "..."
-# PRODUCT_ID  = "..."
+# ACCESS_TOKEN = "your-gumroad-access-token"   # optional
+# PRODUCT_ID  = "your-real-product-id"
+#
 # [openai]
-# OPENAI_API_KEY = "..."
+# OPENAI_API_KEY = "sk-proj-xxxxx"
+#
 # [app]
 # MAX_USES_PER_DAY = "50"
 
@@ -23,7 +26,6 @@ GUMROAD_ACCESS_TOKEN = st.secrets["gumroad"].get("ACCESS_TOKEN", "").strip()
 OPENAI_API_KEY = st.secrets.get("openai", {}).get("OPENAI_API_KEY", "")
 MAX_USES_PER_DAY = int(st.secrets.get("app", {}).get("MAX_USES_PER_DAY", "50"))
 
-# session keys
 SESSION_AUTH = "monreon_auth"
 SESSION_DAY = "monreon_day"
 SESSION_COUNT = "monreon_count"
@@ -32,16 +34,12 @@ SESSION_COUNT = "monreon_count"
 # 2. GUMROAD LICENSE VERIFY
 # ===============================
 def verify_gumroad_license(license_key: str) -> Dict[str, Any]:
-    """
-    Verifies a license against a specific Gumroad product.
-    Uses product_id (the correct way for your product).
-    If you added ACCESS_TOKEN, we send it too.
-    """
     url = "https://api.gumroad.com/v2/licenses/verify"
     payload: Dict[str, Any] = {
         "product_id": GUMROAD_PRODUCT_ID,
         "license_key": license_key.strip(),
     }
+    # optional, but you have it in secrets so we send it
     if GUMROAD_ACCESS_TOKEN:
         payload["access_token"] = GUMROAD_ACCESS_TOKEN
 
@@ -49,7 +47,7 @@ def verify_gumroad_license(license_key: str) -> Dict[str, Any]:
     return resp.json()
 
 # ===============================
-# 3. DATA HELPERS
+# 3. STOCK HELPERS
 # ===============================
 TOP_10_US = [
     "AAPL", "TSLA", "NVDA", "MSFT", "AMZN",
@@ -70,8 +68,8 @@ def calc_momentum(df: pd.DataFrame) -> Dict[str, Any]:
         return {"error": "No data"}
     close = df["Close"]
     last = float(close.iloc[-1])
-    week = (last - close.iloc[-5]) / close.iloc[-5] * 100 if len(close) > 5 else None
-    month = (last - close.iloc[-21]) / close.iloc[-21] * 100 if len(close) > 21 else None
+    week = (last - float(close.iloc[-5])) / float(close.iloc[-5]) * 100 if len(close) > 5 else None
+    month = (last - float(close.iloc[-21])) / float(close.iloc[-21]) * 100 if len(close) > 21 else None
     return {
         "last_price": last,
         "1w_change_pct": week,
@@ -111,7 +109,7 @@ def fetch_fundamentals_like(ticker: str) -> Dict[str, Any]:
 
 def ai_commentary(ticker: str, metrics: Dict[str, Any], mode: str) -> str:
     if not OPENAI_API_KEY:
-        return "AI commentary disabled (no OpenAI key set in Streamlit secrets)."
+        return "AI commentary disabled (no OpenAI key set in secrets)."
     try:
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
@@ -144,7 +142,7 @@ if SESSION_AUTH not in st.session_state:
     st.session_state[SESSION_AUTH] = False
 
 # ===============================
-# 5. HEADER + LICENSE BOX
+# 5. HEADER + LICENSE
 # ===============================
 st.title("📈 Monreon Stock AI — Advanced Market Scanner")
 st.caption("AI-powered stock research • secured with Gumroad license")
@@ -159,7 +157,6 @@ if not st.session_state[SESSION_AUTH]:
             st.success("✅ License verified. Welcome!")
             st.rerun()
         else:
-            # show gumroad’s exact message to help debug
             st.error(data.get("message", "License not valid for this product."))
             st.code(data, language="json")
             st.stop()
@@ -171,20 +168,25 @@ if st.session_state.get(SESSION_COUNT, 0) >= MAX_USES_PER_DAY:
     st.stop()
 
 # ===============================
-# 6. MARKET SNAPSHOT
+# 6. MARKET SNAPSHOT (fixed)
 # ===============================
 st.markdown("### 🏦 Market Snapshot")
 indices = {"S&P 500": "^GSPC", "NASDAQ": "^IXIC", "Dow Jones": "^DJI"}
 cols = st.columns(len(indices))
+
 for i, (name, symbol) in enumerate(indices.items()):
     df_idx = fetch_yf_data(symbol, period="5d", interval="1d")
     if not df_idx.empty:
         latest = float(df_idx["Close"].iloc[-1])
-prev = float(df_idx["Close"].iloc[-2]) if len(df_idx) > 1 else latest
-pct = ((latest - prev) / prev * 100) if prev != 0 else 0
-cols[i].metric(name, f"${latest:,.2f}", f"{pct:+.2f}%")
+        if len(df_idx) > 1:
+            prev = float(df_idx["Close"].iloc[-2])
+        else:
+            prev = latest
+        pct = ((latest - prev) / prev * 100) if prev != 0 else 0.0
+        cols[i].metric(name, f"${latest:,.2f}", f"{pct:+.2f}%")
     else:
         cols[i].write(name)
+
 st.divider()
 
 # ===============================
@@ -227,12 +229,11 @@ period, interval = period_options[period_label]
 run = st.button("🚀 Analyze now", type="primary")
 
 # ===============================
-# 8. RUN ANALYSIS
+# 8. ANALYSIS
 # ===============================
 all_rows: List[Dict[str, Any]] = []
 
 if run:
-    # count usage for this license
     st.session_state[SESSION_COUNT] = st.session_state.get(SESSION_COUNT, 0) + 1
 
     tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
@@ -240,7 +241,6 @@ if run:
         st.subheader(f"📊 {ticker}")
         df = fetch_yf_data(ticker, period=period, interval=interval)
 
-        # chart section
         if not df.empty:
             cA, cB = st.columns([3, 1])
             with cA:
@@ -251,7 +251,6 @@ if run:
             st.warning("No market data for this ticker.")
             continue
 
-        # analysis section
         if analysis_mode == "Find momentum":
             metrics = calc_momentum(df)
         elif analysis_mode == "Check moving averages":
@@ -268,18 +267,15 @@ if run:
         else:
             st.write(metrics)
 
-        # AI commentary
         ai_text = ai_commentary(ticker, metrics, analysis_mode)
         st.info(ai_text)
 
-        # collect for CSV
-        row = {
+        all_rows.append({
             "ticker": ticker,
             "mode": analysis_mode,
             **metrics,
             "ai_commentary": ai_text,
-        }
-        all_rows.append(row)
+        })
 
         st.markdown("---")
 
