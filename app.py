@@ -1,4 +1,4 @@
-# app.py — Monreon Stock AI (Gumroad protected, fixed market header)
+# app.py — Monreon Stock AI (Gumroad protected, safe charts)
 import streamlit as st
 import requests
 import pandas as pd
@@ -9,18 +9,6 @@ from typing import Dict, Any, List
 # ===============================
 # 1. READ SECRETS / CONFIG
 # ===============================
-# secrets.toml should look like:
-#
-# [gumroad]
-# ACCESS_TOKEN = "your-gumroad-access-token"   # optional
-# PRODUCT_ID  = "your-real-product-id"
-#
-# [openai]
-# OPENAI_API_KEY = "sk-proj-xxxxx"
-#
-# [app]
-# MAX_USES_PER_DAY = "50"
-
 GUMROAD_PRODUCT_ID = st.secrets["gumroad"]["PRODUCT_ID"]
 GUMROAD_ACCESS_TOKEN = st.secrets["gumroad"].get("ACCESS_TOKEN", "").strip()
 OPENAI_API_KEY = st.secrets.get("openai", {}).get("OPENAI_API_KEY", "")
@@ -39,10 +27,8 @@ def verify_gumroad_license(license_key: str) -> Dict[str, Any]:
         "product_id": GUMROAD_PRODUCT_ID,
         "license_key": license_key.strip(),
     }
-    # optional, but you have it in secrets so we send it
     if GUMROAD_ACCESS_TOKEN:
         payload["access_token"] = GUMROAD_ACCESS_TOKEN
-
     resp = requests.post(url, data=payload, timeout=10)
     return resp.json()
 
@@ -58,14 +44,27 @@ def fetch_yf_data(ticker: str, period="6mo", interval="1d") -> pd.DataFrame:
     try:
         df = yf.download(ticker, period=period, interval=interval, progress=False)
         if not df.empty:
-            return df.dropna(how="all")
+            return df
     except Exception:
         pass
     return pd.DataFrame()
 
-def calc_momentum(df: pd.DataFrame) -> Dict[str, Any]:
+def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Makes sure dataframe has flat columns and 'Close' / 'Volume' if possible.
+    """
     if df.empty:
-        return {"error": "No data"}
+        return df
+
+    # If columns are MultiIndex (can happen), flatten them
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = ["_".join([c for c in col if c]) for col in df.columns.values]
+
+    return df
+
+def calc_momentum(df: pd.DataFrame) -> Dict[str, Any]:
+    if df.empty or "Close" not in df.columns:
+        return {"error": "No price data"}
     close = df["Close"]
     last = float(close.iloc[-1])
     week = (last - float(close.iloc[-5])) / float(close.iloc[-5]) * 100 if len(close) > 5 else None
@@ -77,8 +76,8 @@ def calc_momentum(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 def calc_moving_avgs(df: pd.DataFrame) -> Dict[str, Any]:
-    if df.empty:
-        return {"error": "No data"}
+    if df.empty or "Close" not in df.columns:
+        return {"error": "No price data"}
     close = df["Close"]
     out = {"last_price": float(close.iloc[-1])}
     for win in [5, 20, 50, 100, 200]:
@@ -87,8 +86,8 @@ def calc_moving_avgs(df: pd.DataFrame) -> Dict[str, Any]:
     return out
 
 def calc_volatility(df: pd.DataFrame) -> Dict[str, Any]:
-    if df.empty:
-        return {"error": "No data"}
+    if df.empty or "Close" not in df.columns:
+        return {"error": "No price data"}
     returns = df["Close"].pct_change().dropna()
     daily = float(returns.std())
     annual = daily * (252 ** 0.5)
@@ -117,7 +116,7 @@ def ai_commentary(ticker: str, metrics: Dict[str, Any], mode: str) -> str:
             f"Analyze the stock {ticker} for a trader.\n"
             f"Mode: {mode}\n"
             f"Metrics: {metrics}\n"
-            f"Give 3 short, actionable insights and say if sentiment is bullish, bearish, or neutral."
+            f"Give 3 short insights and say bullish/bearish/neutral."
         )
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -176,7 +175,8 @@ cols = st.columns(len(indices))
 
 for i, (name, symbol) in enumerate(indices.items()):
     df_idx = fetch_yf_data(symbol, period="5d", interval="1d")
-    if not df_idx.empty:
+    df_idx = normalize_df(df_idx)
+    if not df_idx.empty and "Close" in df_idx.columns:
         latest = float(df_idx["Close"].iloc[-1])
         if len(df_idx) > 1:
             prev = float(df_idx["Close"].iloc[-2])
@@ -240,17 +240,23 @@ if run:
     for ticker in tickers:
         st.subheader(f"📊 {ticker}")
         df = fetch_yf_data(ticker, period=period, interval=interval)
+        df = normalize_df(df)
 
-        if not df.empty:
-            cA, cB = st.columns([3, 1])
-            with cA:
-                st.line_chart(df[["Close"]])
-            with cB:
-                st.bar_chart(df[["Volume"]].tail(60))
-        else:
+        if df.empty or "Close" not in df.columns:
             st.warning("No market data for this ticker.")
             continue
 
+        # price + volume charts — only if columns exist
+        cA, cB = st.columns([3, 1])
+        with cA:
+            st.line_chart(df["Close"])
+        with cB:
+            if "Volume" in df.columns:
+                st.bar_chart(df[["Volume"]].tail(60))
+            else:
+                st.write("No volume data.")
+
+        # analysis
         if analysis_mode == "Find momentum":
             metrics = calc_momentum(df)
         elif analysis_mode == "Check moving averages":
