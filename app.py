@@ -147,7 +147,7 @@ def license_gate():
         st.session_state["is_authed"] = True
         st.session_state["license_key"] = lic.strip()
         st.success("✅ License verified. Welcome!")
-        st.experimental_rerun()
+        st.rerun()
 
     # if no button pressed yet -> block app
     if not st.session_state["is_authed"]:
