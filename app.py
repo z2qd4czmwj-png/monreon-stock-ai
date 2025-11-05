@@ -1,14 +1,18 @@
 import os
-import datetime
-import requests
-import streamlit as st
-import yfinance as yf
-import pandas as pd
+import time
+import datetime as dt
+from typing import Dict, Any, List
 
-# =========================
-# SECRETS / CONFIG
-# =========================
+import streamlit as st
+import pandas as pd
+import yfinance as yf
+import requests
+
+# =========================================================
+# 1) SAFE SECRETS GETTER
+# =========================================================
 def get_secret(section: str, key: str, default: str = "") -> str:
+    """Read from streamlit secrets if present, otherwise env, otherwise default."""
     try:
         if section in st.secrets and key in st.secrets[section]:
             return st.secrets[section][key]
@@ -16,22 +20,34 @@ def get_secret(section: str, key: str, default: str = "") -> str:
         pass
     return os.getenv(key, default)
 
+
+# =========================================================
+# 2) CONFIG FROM SECRETS
+# =========================================================
 GUMROAD_PRODUCT_PERMALINK = get_secret("gumroad", "PRODUCT_PERMALINK", "")
-GUMROAD_ACCESS_TOKEN      = get_secret("gumroad", "ACCESS_TOKEN", "")
-OPENAI_API_KEY            = get_secret("openai", "OPENAI_API_KEY", "")
-MAX_USES_PER_DAY          = int(get_secret("app", "MAX_USES_PER_DAY", "50"))
+GUMROAD_ACCESS_TOKEN = get_secret("gumroad", "ACCESS_TOKEN", "")
+OPENAI_API_KEY = get_secret("openai", "OPENAI_API_KEY", "")
+MAX_USES_PER_DAY = int(get_secret("app", "MAX_USES_PER_DAY", "50"))  # daily per key
 
-# =========================
-# GUMROAD LICENSE CHECK
-# =========================
-def verify_gumroad_license(license_key: str):
-    if not GUMROAD_PRODUCT_PERMALINK:
-        return False, {"message": "Missing Gumroad product permalink."}
+# session key names
+SESSION_AUTH_OK = "monreon_auth_ok"
+SESSION_LICENSE = "monreon_license"
+SESSION_TODAY_COUNT = "monreon_today_count"
+SESSION_TODAY_DATE = "monreon_today_date"
 
+# =========================================================
+# 3) GUMROAD VERIFY FUNCTION
+# =========================================================
+def verify_gumroad_license(license_key: str) -> Dict[str, Any]:
+    """
+    Calls Gumroad's /v2/licenses/verify.
+    We need at least: product_permalink + license_key.
+    access_token is optional but good.
+    """
     url = "https://api.gumroad.com/v2/licenses/verify"
     payload = {
         "product_permalink": GUMROAD_PRODUCT_PERMALINK,
-        "license_key": license_key,
+        "license_key": license_key.strip(),
     }
     if GUMROAD_ACCESS_TOKEN:
         payload["access_token"] = GUMROAD_ACCESS_TOKEN
@@ -39,250 +55,251 @@ def verify_gumroad_license(license_key: str):
     try:
         resp = requests.post(url, data=payload, timeout=10)
         data = resp.json()
-        return data.get("success", False), data
+        return data
     except Exception as e:
-        return False, {"message": f"API error: {e}"}
+        return {"success": False, "message": f"Request failed: {e}"}
 
 
-# =========================
-# SESSION / DAILY USAGE
-# =========================
-def init_state():
-    if "license_valid" not in st.session_state:
-        st.session_state.license_valid = False
-        st.session_state.license_data = {}
-    if "uses_today" not in st.session_state:
-        st.session_state.uses_today = 0
-    if "uses_date" not in st.session_state:
-        st.session_state.uses_date = datetime.date.today().isoformat()
+# =========================================================
+# 4) LICENSE GATE UI
+# =========================================================
+def license_gate():
+    """Shows the sidebar login and enforces daily usage limit."""
+    # init session vars
+    today_str = dt.date.today().isoformat()
+    if SESSION_TODAY_DATE not in st.session_state:
+        st.session_state[SESSION_TODAY_DATE] = today_str
+    if st.session_state.get(SESSION_TODAY_DATE) != today_str:
+        # new day -> reset count
+        st.session_state[SESSION_TODAY_DATE] = today_str
+        st.session_state[SESSION_TODAY_COUNT] = 0
+    if SESSION_TODAY_COUNT not in st.session_state:
+        st.session_state[SESSION_TODAY_COUNT] = 0
+
+    with st.sidebar:
+        st.markdown("🔐 **Monreon AI Login**")
+        if not GUMROAD_PRODUCT_PERMALINK:
+            st.error("Missing Gumroad product permalink in secrets.\n\nAdd:\n[gumroad]\nPRODUCT_PERMALINK = \"yourcode\"")
+        license_key = st.text_input("License key from Gumroad", type="password")
+        st.write(f"Today: {st.session_state[SESSION_TODAY_COUNT]} / {MAX_USES_PER_DAY}")
+        if st.button("Unlock"):
+            if not license_key:
+                st.warning("Enter a license key.")
+            else:
+                data = verify_gumroad_license(license_key)
+                if data.get("success"):
+                    # You could also check "uses" or "chargebacked" here
+                    st.session_state[SESSION_AUTH_OK] = True
+                    st.session_state[SESSION_LICENSE] = license_key
+                    st.success("License verified. Welcome!")
+                    st.rerun()
+                else:
+                    msg = data.get("message", "License not valid.")
+                    st.error(msg)
+
+    # now enforce limit + auth
+    if not st.session_state.get(SESSION_AUTH_OK, False):
+        st.stop()
+
+    # daily usage limit
+    if st.session_state[SESSION_TODAY_COUNT] >= MAX_USES_PER_DAY:
+        st.error("Daily limit reached for this key.")
+        st.stop()
 
 
-def reset_if_new_day():
-    today = datetime.date.today().isoformat()
-    if st.session_state.get("uses_date") != today:
-        st.session_state.uses_today = 0
-        st.session_state.uses_date = today
+# =========================================================
+# 5) STOCK HELPERS
+# =========================================================
+TOP_US_PRESET = [
+    "AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "META",
+    "GOOGL", "AMD", "AVGO", "JPM"
+]
 
-
-def bump_usage():
-    st.session_state.uses_today += 1
-
-
-# =========================
-# DATA + ANALYSIS HELPERS
-# =========================
-def fetch_price_history(ticker: str, period="6mo", interval="1d"):
+def fetch_yf_data(ticker: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
     try:
         df = yf.download(ticker, period=period, interval=interval, progress=False)
-        if not df.empty:
-            return df
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            df.dropna(how="all", inplace=True)
+        return df
     except Exception:
-        pass
-    return pd.DataFrame()
+        return pd.DataFrame()
 
 
-def calc_momentum(df):
-    if df.empty:
-        return {"error": "No data"}
-    close = df["Close"]
-    latest = close.iloc[-1]
-    week = (latest - close.iloc[-5]) / close.iloc[-5] * 100 if len(close) > 5 else None
-    month = (latest - close.iloc[-21]) / close.iloc[-21] * 100 if len(close) > 21 else None
-    return {"last_price": latest, "1w_change_pct": week, "1m_change_pct": month}
-
-
-def calc_moving_avgs(df):
-    if df.empty:
-        return {"error": "No data"}
-    close = df["Close"]
-    out = {"last_price": close.iloc[-1]}
-    for win in [5, 20, 50, 100, 200]:
-        if len(close) >= win:
-            out[f"SMA_{win}"] = close.rolling(win).mean().iloc[-1]
-    return out
-
-
-def calc_volatility(df):
-    if df.empty:
-        return {"error": "No data"}
-    returns = df["Close"].pct_change().dropna()
-    daily = returns.std()
-    ann = daily * (252 ** 0.5)
-    return {"daily_volatility": float(daily), "annualized_volatility": float(ann)}
-
-
-def fetch_fundamentals(ticker: str):
-    try:
-        info = yf.Ticker(ticker).fast_info
-        return {
-            "last_price": info.get("lastPrice"),
-            "market_cap": info.get("marketCap"),
-            "year_high": info.get("yearHigh"),
-            "year_low": info.get("yearLow"),
-            "currency": info.get("currency"),
-        }
-    except Exception:
-        return {"error": "Fundamentals unavailable"}
-
-
-def ai_commentary(ticker, metrics, mode):
-    if not OPENAI_API_KEY:
-        return "AI commentary unavailable (no OpenAI key configured)."
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        prompt = (
-            f"You are a professional market analyst. "
-            f"Summarize {ticker}'s outlook based on: {metrics}. "
-            f"Use a confident tone and highlight sentiment (bullish/bearish/neutral). "
-            f"Give 3 concise actionable points."
-        )
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=200,
-            temperature=0.4,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        return f"AI failed: {e}"
-
-
-# =========================
-# MARKET TOP 10
-# =========================
-def top_10_traded():
+def analyze_ticker(ticker: str) -> Dict[str, Any]:
     """
-    Returns a static list (YFinance doesn’t provide live volume screeners)
+    Returns a small dict with info we can show.
+    You can grow this later (RSI, MA crossover, etc.)
     """
-    return ["AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "META", "GOOG", "NFLX", "AMD", "INTC"]
+    ticker = ticker.upper().strip()
+    info: Dict[str, Any] = {"ticker": ticker, "ok": False}
+
+    df = fetch_yf_data(ticker, period="6mo", interval="1d")
+    if df.empty:
+        info["reason"] = "No data from yfinance"
+        return info
+
+    # simple signals
+    close = df["Close"].iloc[-1]
+    info["last_price"] = float(close)
+
+    # momentum: last close vs 20d avg
+    last_20 = df["Close"].tail(20)
+    info["ma20"] = float(last_20.mean())
+    info["momentum"] = "bullish" if close > last_20.mean() else "neutral/weak"
+
+    # volume snapshot
+    info["last_volume"] = int(df["Volume"].iloc[-1])
+    info["avg_volume_20"] = int(df["Volume"].tail(20).mean())
+
+    info["ok"] = True
+    return info
 
 
-# =========================
-# STREAMLIT UI
-# =========================
-st.set_page_config(page_title="Monreon Stock AI — Advanced Market Scanner", layout="wide")
-init_state()
-reset_if_new_day()
-
-# ---- SIDEBAR ----
-with st.sidebar:
-    st.markdown("### 🔐 Monreon AI Login")
-    license_key = st.text_input("License key", type="password")
-    if st.button("Unlock"):
-        ok, data = verify_gumroad_license(license_key)
-        if ok:
-            st.session_state.license_valid = True
-            st.session_state.license_data = data
-            st.success("✅ License verified!")
+def build_dataframe(results: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for r in results:
+        if not r.get("ok"):
+            rows.append({
+                "ticker": r.get("ticker"),
+                "status": r.get("reason", "no data"),
+            })
         else:
-            st.error(data.get("message", "License invalid."))
+            rows.append({
+                "ticker": r["ticker"],
+                "price": r["last_price"],
+                "ma20": r["ma20"],
+                "momentum": r["momentum"],
+                "last_volume": r["last_volume"],
+                "avg_volume_20": r["avg_volume_20"],
+            })
+    return pd.DataFrame(rows)
 
-    st.write(f"Today: {st.session_state.uses_today} / {MAX_USES_PER_DAY}")
 
-    if not st.session_state.license_valid:
-        st.stop()
-    if st.session_state.uses_today >= MAX_USES_PER_DAY:
-        st.error("Daily usage limit reached.")
-        st.stop()
+# =========================================================
+# 6) MAIN APP
+# =========================================================
+def main():
+    st.set_page_config(page_title="Monreon Stock AI — Market Scanner", layout="wide")
 
-# ---- HEADER ----
-st.title("📊 Monreon Stock AI — Advanced Market Scanner")
-st.caption("Smarter analysis powered by AI + market data")
+    # 1) gate
+    license_gate()
 
-# Small market overview
-st.markdown("#### 🏦 Market Snapshot")
-major_indices = {"S&P 500": "^GSPC", "NASDAQ": "^IXIC", "Dow Jones": "^DJI"}
-cols = st.columns(3)
-for i, (name, symbol) in enumerate(major_indices.items()):
-    df = fetch_price_history(symbol, period="5d")
-    if not df.empty:
-        latest = df["Close"].iloc[-1]
-        change = (df["Close"].iloc[-1] - df["Close"].iloc[-2]) / df["Close"].iloc[-2] * 100
-        cols[i].metric(name, f"${latest:,.2f}", f"{change:+.2f}%")
+    # if we passed gate, increase daily counter when user actually scans
+    st.title("📈 Monreon Stock AI — Market Scanner")
+    st.caption("AI-style stock research (licensed through Gumroad).")
 
-st.divider()
+    left, right = st.columns([2, 1])
 
-# ---- USER INPUT ----
-preset = st.radio("Choose input mode:", ["Manual input", "Top 10 Most Traded US Stocks"])
-if preset == "Manual input":
-    tickers_raw = st.text_input("Enter tickers (comma separated)", "AAPL, TSLA, NVDA")
-else:
-    tickers_raw = ", ".join(top_10_traded())
-    st.info("Auto-filled with Top 10 Most Traded Stocks")
+    with right:
+        st.markdown("### 🔁 Quick presets")
+        if st.button("Top 10 US today"):
+            st.session_state["tickers_input"] = ", ".join(TOP_US_PRESET)
+        if st.button("Only big tech"):
+            st.session_state["tickers_input"] = "AAPL, MSFT, AMZN, META, GOOGL"
+        if st.button("Semiconductors"):
+            st.session_state["tickers_input"] = "NVDA, AMD, AVGO, ASML"
 
-periods = {
-    "6 months (1d)": ("6mo", "1d"),
-    "1 month (1d)": ("1mo", "1d"),
-    "5 days (15m)": ("5d", "15m"),
-    "1 day (5m)": ("1d", "5m"),
-}
-col1, col2 = st.columns([2, 2])
-with col1:
-    period_label = st.selectbox("Timeframe", list(periods.keys()))
-with col2:
-    mode = st.selectbox(
-        "Analysis mode",
-        [
-            "Find momentum",
-            "Check moving averages",
-            "Check volatility",
-            "Quick fundamentals",
-            "AI summary (if OpenAI key)",
-        ],
-    )
+        st.markdown("---")
+        st.markdown("### Export")
+        if "last_df" in st.session_state:
+            csv = st.session_state["last_df"].to_csv(index=False).encode("utf-8")
+            st.download_button("Download latest scan as CSV", csv, "monreon_scan.csv", "text/csv")
 
-period, interval = periods[period_label]
-if st.button("🔍 Analyze Now", type="primary"):
-    bump_usage()
-    tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
-    all_rows = []
+        st.markdown("---")
+        st.markdown("### Info")
+        st.write(f"🔑 License: {st.session_state.get(SESSION_LICENSE, '')[:6]}•••")
+        st.write(f"📅 Today used: {st.session_state[SESSION_TODAY_COUNT]} / {MAX_USES_PER_DAY}")
 
-    for ticker in tickers:
-        st.subheader(f"📈 {ticker}")
-        df = fetch_price_history(ticker, period=period, interval=interval)
+    with left:
+        # user input
+        default_tickers = st.session_state.get("tickers_input", "AAPL, TSLA, NVDA")
+        tickers_str = st.text_input("Enter tickers (comma separated)", value=default_tickers)
+        st.session_state["tickers_input"] = tickers_str
 
-        if df.empty:
-            st.warning("No data available.")
-            continue
-
-        # Chart with price + volume
-        chart_cols = st.columns([3, 1])
-        with chart_cols[0]:
-            st.line_chart(df[["Close"]], height=220)
-        with chart_cols[1]:
-            st.bar_chart(df[["Volume"]], height=220)
-
-        if mode == "Find momentum":
-            metrics = calc_momentum(df)
-        elif mode == "Check moving averages":
-            metrics = calc_moving_avgs(df)
-        elif mode == "Check volatility":
-            metrics = calc_volatility(df)
-        elif mode == "Quick fundamentals":
-            metrics = fetch_fundamentals(ticker)
-        else:
-            metrics = {"last_close": float(df["Close"].iloc[-1])}
-
-        if "error" in metrics:
-            st.error(metrics["error"])
-            continue
-
-        st.write(metrics)
-        summary = ai_commentary(ticker, metrics, mode)
-        st.info(summary)
-
-        row = {"ticker": ticker, "mode": mode, **metrics, "ai_commentary": summary}
-        all_rows.append(row)
-        st.divider()
-
-    if all_rows:
-        out_df = pd.DataFrame(all_rows)
-        st.download_button(
-            "⬇️ Download results as CSV",
-            data=out_df.to_csv(index=False).encode(),
-            file_name="monreon_stock_ai_results.csv",
-            mime="text/csv",
+        scan_mode = st.selectbox(
+            "What do you want?",
+            [
+                "Find momentum",
+                "Check volume vs average",
+                "Simple price snapshot",
+                "Full scan (slower)",
+            ],
         )
 
-st.caption("© 2025 Monreon AI. Licensed for personal/client use only. Redistribution or sharing of license keys is prohibited.")
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            period = st.selectbox("History period", ["1mo", "3mo", "6mo", "1y"], index=2)
+        with col_b:
+            interval = st.selectbox("Interval", ["1d", "1h", "30m", "15m"], index=0)
+        with col_c:
+            chart_ticker = st.text_input("Chart a single ticker", value="AAPL")
+
+        if st.button("Analyze now", type="primary"):
+            # charge 1 use
+            st.session_state[SESSION_TODAY_COUNT] += 1
+
+            tickers = [t.strip().upper() for t in tickers_str.split(",") if t.strip()]
+            results = []
+            with st.spinner("Scanning..."):
+                for t in tickers:
+                    res = analyze_ticker(t)
+                    results.append(res)
+                    # tiny sleep just to be nice to yfinance
+                    time.sleep(0.1)
+
+            df = build_dataframe(results)
+            st.session_state["last_df"] = df
+
+            st.subheader("Scan Result")
+            st.dataframe(df, use_container_width=True)
+
+            # show AI-ish interpretation per ticker
+            for r in results:
+                st.markdown("---")
+                st.markdown(f"#### {r.get('ticker')}")
+                if not r.get("ok"):
+                    st.warning(r.get("reason", "No data"))
+                    continue
+
+                price = r["last_price"]
+                ma20 = r["ma20"]
+                mom = r["momentum"]
+                vol = r["last_volume"]
+                vol_avg = r["avg_volume_20"]
+
+                st.write(f"• Recent price: **{price:.2f}**")
+                st.write(f"• 20-day average: **{ma20:.2f}**")
+                st.write(f"• Momentum signal: **{mom}**")
+                st.write(f"• Volume last vs avg20: **{vol} vs {vol_avg}**")
+
+                # lightweight "AI" text
+                notes = []
+                if price > ma20:
+                    notes.append("price is trading above short-term average")
+                if vol > vol_avg * 1.3:
+                    notes.append("volume spike detected")
+                if mom == "bullish":
+                    notes.append("bullish structure in short window")
+
+                if notes:
+                    st.info("AI notes: " + "; ".join(notes))
+                else:
+                    st.info("AI notes: normal conditions.")
+
+        # chart section
+        st.markdown("---")
+        st.subheader("Price chart")
+        chart_df = fetch_yf_data(chart_ticker.upper().strip(), period=period, interval=interval)
+        if not chart_df.empty:
+            st.line_chart(chart_df["Close"], height=240)
+            st.caption("Close price")
+            # small volume table
+            vol_df = chart_df[["Volume"]].tail(30)
+            st.bar_chart(vol_df, height=160)
+            st.caption("Recent volume")
+        else:
+            st.write("No data for that ticker.")
+
+
+if __name__ == "__main__":
+    main()
